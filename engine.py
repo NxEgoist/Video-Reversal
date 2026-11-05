@@ -175,7 +175,7 @@ def local_api_key(name):
         if field.strip()==name: return value.strip()
     return ''
 
-def connection(provider='Gemini', model='', base_url='', key=''):
+def connection(provider='Gemini', model='', base_url='', key='', allow_env_key=True):
     if provider not in PRESETS:
         raise ValueError('请选择支持的 API 类型。')
     default_url, default_model, env_key = PRESETS[provider]
@@ -183,7 +183,7 @@ def connection(provider='Gemini', model='', base_url='', key=''):
     if not model:
         raise ValueError('请填写模型名称。')
     explicit_key=key.strip()
-    key = (explicit_key or os.getenv(env_key, '') or local_api_key(env_key)).strip()
+    key = (explicit_key or ((os.getenv(env_key, '') or local_api_key(env_key)) if allow_env_key else '')).strip()
     if provider == 'Gemini':
         if not key: raise ValueError('请填写 API 密钥，或设置 GEMINI_API_KEY。')
         return {'provider':provider, 'model':model, 'key':key, 'url':''}

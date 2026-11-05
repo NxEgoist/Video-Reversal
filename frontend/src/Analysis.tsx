@@ -1,0 +1,27 @@
+import { useEffect, useRef, useState } from 'react'
+
+type Prompts = {text_zh:string; text_en:string; image_zh:string; image_en:string}
+type Clip = {id:string; analysis?: {prompts?:Prompts}}
+type Task = {status:string; error?:string}
+type Case = {id:string;title:string}
+const empty:Prompts = {text_zh:'',text_en:'',image_zh:'',image_en:''}
+async function request<T>(url:string, options?:RequestInit):Promise<T> {const r=await fetch(url,options); if(!r.ok){const e=await r.json().catch(()=>({}));throw Error(e.detail||'请求失败')} return r.json()}
+const json = (method:string, data:unknown):RequestInit => ({method,headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+export default function Analysis({provider,jobId,clip,task,onRefresh,onRestore}:{provider:string;jobId:string;clip?:Clip;task?:Task;onRefresh:()=>Promise<void>;onRestore:(id:string)=>void}) {
+ const [strategy,setStrategy]=useState('等间隔')
+ const [draft,setDraft]=useState<Prompts>(empty),[error,setError]=useState(''),[cases,setCases]=useState<Case[]>([]),[title,setTitle]=useState(''),[caseId,setCaseId]=useState('')
+ const drafts=useRef<Record<string,Prompts>>({})
+ const [saved,setSaved]=useState('')
+ const processing=task?.status==='processing'
+ useEffect(()=>{const original=clip?.analysis?.prompts || empty;setSaved(JSON.stringify(original));setDraft(drafts.current[`${jobId}/${clip?.id || ''}`] || original)},[jobId,clip?.id])
+ useEffect(()=>{if(!processing && clip?.analysis?.prompts && !drafts.current[`${jobId}/${clip.id}`]){setDraft(clip.analysis.prompts);setSaved(JSON.stringify(clip.analysis.prompts))}},[processing,clip?.id,clip?.analysis])
+ const dirty=JSON.stringify(draft)!==saved
+ const pendingDrafts=Object.keys(drafts.current).some(id=>id.startsWith(`${jobId}/`))
+ useEffect(()=>{if(!processing)return;const id=setInterval(()=>{void onRefresh().catch(e=>setError(e.message))},2000);return()=>clearInterval(id)},[processing,jobId,onRefresh])
+ async function start(){if(!clip)return;try{setError('');await request(`/api/jobs/${jobId}/clips/${clip.id}/analysis`,json('POST',{provider,use_saved:true,strategy,image_mode:'单帧'}));await onRefresh()}catch(e){setError(e instanceof Error?e.message:String(e))}}
+ async function save(){if(!clip)return;try{await request(`/api/jobs/${jobId}/clips/${clip.id}/prompts`,json('PUT',draft));delete drafts.current[`${jobId}/${clip.id}`];setSaved(JSON.stringify(draft));await onRefresh()}catch(e){setError(e instanceof Error?e.message:String(e))}}
+ async function list(){try{setCases(await request('/api/cases'))}catch(e){setError(e instanceof Error?e.message:String(e))}}
+ async function store(){try{await request(`/api/jobs/${jobId}/cases`,json('POST',{title}));setTitle('');await list()}catch(e){setError(e instanceof Error?e.message:String(e))}}
+ async function open(){try{const result=await request<{id:string}>(`/api/cases/${caseId}/restore`,{method:'POST'});onRestore(result.id)}catch(e){setError(e instanceof Error?e.message:String(e))}}
+ return <><section className="analysis-panel panel"><div className="panel-heading"><div><span className="index">04</span><strong>片段分析与提示词</strong></div></div><div className="analysis-body"><p className="hint">分析会将采样画面发送至所选服务商，可能产生费用。使用本地保存的模型配置。</p>{error&&<div className="error" role="alert">{error}</div>}<div className="model-grid"><p className="hint">当前服务商：{provider} · 可在模型配置页面修改。</p><label>抽帧策略<select value={strategy} onChange={e=>setStrategy(e.target.value)}><option>等间隔</option><option>变化驱动</option><option>Prompt 专用</option></select></label><button onClick={start} disabled={!clip||processing||dirty}>{processing?'分析中…':'分析当前片段'}</button></div>{task&&<p className="task-status">分析状态：{task.status}{task.error?` · ${task.error}`:''}</p>}{clip?.analysis?.prompts&&<><div className="prompt-grid">{([['text_zh','文生视频 · 中文'],['text_en','文生视频 · English'],['image_zh','图生视频 · 中文'],['image_en','图生视频 · English']] as const).map(([field,label])=><label key={field}>{label}<textarea disabled={processing} value={draft[field]} onChange={e=>{const next={...draft,[field]:e.target.value};setDraft(next);if(clip) drafts.current[`${jobId}/${clip.id}`]=next}} rows={5}/></label>)}</div><button className="primary-action" onClick={save} disabled={processing}>保存提示词</button>{dirty&&<p className="hint">提示词有未保存修改；保存后才能分析或保存案例。切换片段时草稿保留在当前页面，刷新页面前请先保存。</p>}</>}</div></section><section className="analysis-panel panel"><div className="panel-heading"><div><span className="index">05</span><strong>案例与导出</strong></div></div><div className="case-actions"><input value={title} onChange={e=>setTitle(e.target.value)} placeholder="案例名称"/><button onClick={store} disabled={!title.trim()||processing||dirty||pendingDrafts}>保存案例</button><button onClick={list}>刷新案例</button><select value={caseId} onChange={e=>setCaseId(e.target.value)}><option value="">选择案例</option>{cases.map(c=><option key={c.id} value={c.id}>{c.title}</option>)}</select><button onClick={open} disabled={!caseId}>打开副本</button><a href={`/api/jobs/${jobId}/export`}>下载分析包 ↓</a></div><p className="hint case-hint">请先保存所有片段的提示词草稿再保存案例；打开案例会创建新的工作副本。</p></section></>
+}

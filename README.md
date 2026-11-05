@@ -103,3 +103,26 @@ python app.py
 在左侧「案例库」填写名称并点击「保存当前案例」。案例以独立快照保存在本机 `data/cases/`，包含视频、各镜头分析、当前编辑框中的提示词、参考帧、对白和已关联主体；不会保存 API 密钥。若切点或主体关联尚未保存，请先在对应区域保存。
 
 从下拉列表选择案例后点击「打开案例」，会创建新的工作副本供继续编辑，保存的案例内容不受影响。要把修改后的版本也保存下来，可再次保存为新案例。案例与项目数据都保存在本机，请根据自己的需要备份。
+
+## React + FastAPI 工作台（迁移中）
+
+现有 Gradio 工作台暂时保留。新工作台支持视频与镜头、Clip、采样、模型分析、提示词、上下文、音频、案例与导出；详细迁移边界见 [FRONTEND_MIGRATION.md](FRONTEND_MIGRATION.md)。
+
+```bash
+pip install -r requirements.txt -r requirements-api.txt
+python -m uvicorn backend.api:app --host 127.0.0.1 --port 8000
+```
+
+另开终端：
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+打开 http://127.0.0.1:5173。当前仅用于可信本机，服务没有远程访问认证，请勿暴露到公网。
+
+React 工作台的「模型配置」集中保存服务商设置，包括硅基流动、OpenCode Go 和原有服务商。硅基流动默认复用已有的 `SILICONFLOW_API_KEY`；OpenCode Go 默认读取本机 OpenCode 的 Go 地址对应密钥，也可填写 `OPENCODE_GO_API_KEY`。页面可保存新密钥；`.model-settings.json` 为权限受限的本地明文文件，已排除在版本管理外，密钥不会返回页面、写入任务或导出。切换默认服务商后，片段和镜头分析均使用该配置。更换远程地址时必须输入该地址专用密钥。OpenCode Go 的模型、接口与图片输入能力可能变化，需自行验证；文本连接成功不代表支持视频帧分析。
+
+片段提示词在页面内切换片段或配置页时保留未保存草稿；刷新或关闭页面前仍须保存。批量分析遇到单个镜头失败时会继续其他镜头，结束后显示未完成项。
