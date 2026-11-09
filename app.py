@@ -48,7 +48,7 @@ def comparison_text(result):
     camera_warnings=(result.get('observation') or {}).get('camera_review',[])
     warning=f'｜运镜待核对：{len(camera_warnings)} 处' if camera_warnings else ''
     if result.get('status')=='complete_partial': warning+='｜部分补看超时，结果不完整'
-    if result.get('prompt_review'): warning+=f"｜动作方向待核对：{len(result['prompt_review'])} 处"
+    if result.get('prompt_review'): warning+=f"｜提示词待核对：{len(result['prompt_review'])} 处"
     return (f"采样帧：{result['sampling_frame_count']}｜耗时：{result['elapsed_s']} 秒｜用量：{tokens}{warning}\n"
             + '\n'.join(f'{label}：\n{p.get(key, "")}' for key,label in [('text_zh','文生视频 · 中文'),('text_en','文生视频 · English'),('image_zh','图生视频 · 中文'),('image_en','图生视频 · English')]))
 
@@ -67,7 +67,7 @@ def show(job_id,index):
     summary=f"{preview.get('strategy','')} · {len(frames)} 帧（与原视频时间对应）" if frames else '暂无采样预览。'
     camera_warnings=(s.get('observation') or {}).get('camera_review',[])
     if camera_warnings: summary+=f'  \n⚠️ 有 {len(camera_warnings)} 处画面整体位移与镜头描述可能冲突，请在分析证据中核对。'
-    if s.get('prompt_review'): summary+=f"  \n⚠️ 有 {len(s['prompt_review'])} 处动作方向表述不明确，请对照画面核对。"
+    if s.get('prompt_review'): summary+=f"  \n⚠️ 有 {len(s['prompt_review'])} 处提示词需要对照画面核对。"
     if (s.get('observation') or {}).get('incomplete_review'): summary+='  \n⚠️ 部分动作补看未完成；当前 Prompt 是部分结果，可点击“继续上次分析”。'
     if s.get('status')=='failed' and s.get('error'): summary+='  \n⚠️ '+s['error']
     comparisons=s.get('comparisons') or {}
@@ -79,7 +79,7 @@ def all_shots(job_id, provider, model, url, key, strategy, image_mode, progress=
     except ValueError as e: raise gr.Error(str(e))
     job=engine.load(job_id); errors=[]; partial=[]
     for i in progress.tqdm(range(len(job['shots'])),desc='逐镜头分析'):
-        if job['shots'][i]['status']=='complete': continue
+        if job['shots'][i]['status']=='complete' or job['shots'][i].get('skip_bulk'): continue
         try: engine.analyze(job,i,config,resume=True)
         except Exception as e: errors.append(f"{job['shots'][i]['id']}：{e}")
         else:
@@ -125,7 +125,7 @@ def save_edits(job_id,index,override_text,start,end,reference,tz,te,iz,ie):
             s['start_ms']=a;s['end_ms']=b
             for j in affected:
                 x=job['shots'][j];x['observation']=None;x['prompts']=None;x['status']='pending';x['reference_ms']=x['start_ms'];x['error']=None
-                x.pop('sample_preview',None); x.pop('comparisons',None); x.pop('reference_user_selected',None); x.pop('analysis_checkpoint',None); x.pop('prompt_review',None)
+                x.pop('black_screen',None); x.pop('skip_bulk',None); x.pop('sample_preview',None); x.pop('comparisons',None); x.pop('reference_user_selected',None); x.pop('analysis_checkpoint',None); x.pop('prompt_review',None)
                 if 'clips' in job: clips.reset_shot(job,x['id'])
             s['overrides']=override;engine.save(job)
             return gr.update(choices=labels(job),value=index),'切点已更新；受影响镜头需重新分析，人工修正已保留。'
@@ -420,7 +420,7 @@ with gr.Blocks(title='视频反推 Prompt',css=CSS,theme=gr.themes.Soft(primary_
                 api_status=gr.Textbox(label='连接状态',interactive=False)
 
             video=gr.Video(label='上传视频',sources=['upload'],format='mp4')
-            gr.Markdown('<span class="note">支持 60 秒以内、200 MB 以内的 MP4 / MOV。分析画面会发送至配置的模型服务。音频可选择单独转写。</span>')
+            gr.Markdown('<span class="note">支持 180 秒以内、200 MB 以内的 MP4 / MOV。分析画面会发送至配置的模型服务。音频可选择单独转写。</span>')
             with gr.Row():
                 create=gr.Button('创建任务',variant='primary'); analyze=gr.Button('分析全部镜头')
             with gr.Accordion('恢复已有任务',open=False):
@@ -469,7 +469,7 @@ with gr.Blocks(title='视频反推 Prompt',css=CSS,theme=gr.themes.Soft(primary_
                 context_save_btn=gr.Button('保存全片上下文')
             with gr.Accordion('采样与对比',open=True):
                 with gr.Row():
-                    strategy=gr.Radio(['等间隔','变化驱动','Prompt 专用'],value='等间隔',label='抽帧策略')
+                    strategy=gr.Radio(['等间隔','快速（1 FPS）','变化驱动','Prompt 专用'],value='等间隔',label='抽帧策略')
                     image_mode=gr.Radio(['单帧','拼图'],value='单帧',label='发送方式')
                 gr.Markdown('<span class="note">等间隔保留原策略；变化驱动按画面变化补帧；Prompt 专用结合 TransNetV2 转场、动作三帧组、清晰度与时间覆盖。首次会在本机加载模型。拼图可能丢失细节，实际费用取决于模型。</span>')
                 preview_btn=gr.Button('预览采样帧（不调用模型）')

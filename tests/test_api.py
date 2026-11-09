@@ -10,6 +10,53 @@ from backend.api import app
 
 
 class ApiTests(unittest.TestCase):
+    def test_full_shot_results_are_visible_to_matching_clip_without_overwriting_edits(self):
+        import clips
+        with tempfile.TemporaryDirectory() as tmp,patch.object(engine,'DATA',Path(tmp)):
+            folder=Path(tmp)/'abc';folder.mkdir()
+            prompts={'text_zh':'镜头结果','text_en':'scene','image_zh':'动作','image_en':'motion'}
+            job={'id':'abc','video':{'file':'source.mp4','duration_ms':2000},'shots':[{'id':'s1','start_ms':0,'end_ms':2000,'status':'complete','prompts':prompts,'observation':{'windows':[]}}]}
+            clip=clips.ensure(job)[0];engine.save(job)
+            with TestClient(app) as client:
+                result=client.get('/api/jobs/abc').json()['clips'][0]
+                self.assertEqual(result['analysis_source'],'shot')
+                self.assertEqual(result['analysis']['prompts']['text_zh'],'镜头结果')
+                self.assertNotIn('analysis',engine.load('abc')['clips'][0])
+                edited={**prompts,'text_zh':'人工片段修订'}
+                self.assertEqual(client.put(f"/api/jobs/abc/clips/{clip['id']}/prompts",json=edited).status_code,200)
+                result=client.get('/api/jobs/abc').json()['clips'][0]
+                self.assertEqual(result['analysis']['prompts']['text_zh'],'人工片段修订')
+                self.assertEqual(engine.load('abc')['shots'][0]['prompts']['text_zh'],'镜头结果')
+                result=client.post(f"/api/jobs/abc/clips/{clip['id']}/split",json={'time_ms':1000})
+                self.assertEqual(result.status_code,200)
+                self.assertTrue(all('analysis' not in c for c in result.json()['clips']))
+
+    def test_failed_clip_retains_checkpoint_for_retry(self):
+        import clips
+        from backend import api
+        with tempfile.TemporaryDirectory() as tmp, patch.object(engine,'DATA',Path(tmp)):
+            folder=Path(tmp)/'abc';folder.mkdir()
+            job={'id':'abc','video':{'file':'source.mp4','duration_ms':2000},'shots':[{'id':'s1','start_ms':0,'end_ms':2000,'status':'pending'}]}
+            clip=clips.ensure(job)[0];engine.save(job)
+            frame={'time_ms':0}; calls=[]
+            def analyze(temp,index,config,resume=False):
+                calls.append(temp['shots'][0].get('analysis_checkpoint'))
+                if len(calls)==1:
+                    temp['shots'][0]['analysis_checkpoint']={'fingerprint':'x','windows':{'0':{'scene':'已完成'}}}
+                    raise ValueError('分析画面窗口 2/7：API 请求超时')
+                temp['shots'][0]['status']='complete'
+            with patch.object(api.clips,'evidence',return_value={'head_frames':[frame],'tail_frames':[frame]}),patch.object(engine,'analyze',side_effect=analyze),TestClient(app) as client:
+                url=f"/api/jobs/abc/clips/{clip['id']}/analysis"
+                body={'provider':'自定义（OpenAI 兼容）','model':'test','url':'http://127.0.0.1:1234/v1'}
+                for expected in ('failed','complete'):
+                    self.assertEqual(client.post(url,json=body).status_code,202)
+                    for _ in range(200):
+                        current=client.get('/api/jobs/abc').json()
+                        if current['api_task']['status']!='processing':break
+                        time.sleep(.01)
+                    self.assertEqual(current['api_task']['status'],expected)
+                self.assertEqual(calls[1]['windows']['0']['scene'],'已完成')
+
     def test_video_analysis_case_and_export_end_to_end(self):
         import zipfile
         import io

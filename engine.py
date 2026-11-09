@@ -22,8 +22,22 @@ DATA = ROOT / 'data'
 DATA.mkdir(exist_ok=True)
 MAX_SIZE = 200 * 1024 * 1024
 
-class ModelTimeoutError(ValueError):
+class ModelRetryableError(ValueError):
+    def __init__(self, message, retry_delay=2):
+        super().__init__(message)
+        self.retry_delay=retry_delay
+
+class ModelTimeoutError(ModelRetryableError):
     pass
+
+class ModelFormatError(ValueError):
+    pass
+
+def retry_delay(headers):
+    raw=headers.get('retry-after','') if headers else ''
+    try: delay=max(2,float(raw)) if raw else 2
+    except ValueError: return None
+    return delay if delay<=10 else None
 
 class Beat(BaseModel):
     start_ms: int
@@ -80,8 +94,8 @@ def create(path):
         raise ValueError('请上传不超过 200 MB 的 MP4 或 MOV 文件。')
     info = json.loads(run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration:stream=codec_type,width,height', '-of', 'json', str(src)]))
     duration = int(float(info['format']['duration']) * 1000)
-    if not 0 < duration <= 60000:
-        raise ValueError('请上传时长大于 0 秒且不超过 60 秒的视频。')
+    if not 0 < duration <= 180000:
+        raise ValueError('请上传时长大于 0 秒且不超过 180 秒的视频。')
     streams = info.get('streams', [])
     if not any(s.get('codec_type') == 'video' for s in streams):
         raise ValueError('文件中没有视频轨道。')
@@ -220,7 +234,7 @@ def _call_model_once(job, instruction, images, schema, config=None):
     parts = image_parts(job, images, config.get('image_mode','单帧'))
     if config['provider'] == 'Gemini':
         from google import genai
-        from google.genai import types
+        from google.genai import errors, types
         client = genai.Client(api_key=config['key'])
         content = [instruction]
         for label, data in parts:
@@ -229,6 +243,13 @@ def _call_model_once(job, instruction, images, schema, config=None):
             response = client.models.generate_content(model=model,contents=content,config=types.GenerateContentConfig(response_mime_type='application/json',response_schema=schema,temperature=0.2))
         except (TimeoutError,httpx.TimeoutException) as exc:
             raise ModelTimeoutError('API 请求超时；可稍后继续上次分析。') from exc
+        except errors.APIError as exc:
+            if exc.code in (408,429,500,502,503,504):
+                response=getattr(exc,'response',None)
+                raise ModelRetryableError(f'Gemini 暂时不可用（HTTP {exc.code}），请稍后重试。',retry_delay(getattr(response,'headers',{}))) from exc
+            raise ValueError(f'Gemini 请求失败（HTTP {exc.code}），请检查密钥、模型权限和图片输入能力。') from exc
+        except httpx.RequestError as exc:
+            raise ModelRetryableError('Gemini 网络连接失败；可检查网络后重试。') from exc
         except Exception as exc:
             raise ValueError('Gemini 请求失败，请检查密钥、模型权限和网络连接。') from exc
         if not response.text: raise ValueError('模型未返回内容。')
@@ -241,6 +262,10 @@ def _call_model_once(job, instruction, images, schema, config=None):
             encoded=base64.b64encode(data).decode('ascii')
             content += [{'type':'text','text':label}, {'type':'image_url','image_url':{'url':'data:image/jpeg;base64,'+encoded}}]
         headers={'Authorization':'Bearer '+config['key']} if config['key'] else {}
+        endpoint=urlsplit(config['url'])
+        if endpoint.hostname == 'opencode.ai' and endpoint.path.startswith('/zen/go/'):
+            headers['x-opencode-session']=config.setdefault('_opencode_session_id', uuid.uuid4().hex)
+            headers['User-Agent']='video-reversal/0.1'
         payload={'model':model,'messages':[{'role':'user','content':content}], 'temperature':0.2}
         if urlsplit(config['url']).hostname == 'api.siliconflow.cn':
             payload['response_format']={'type':'json_object'}
@@ -250,13 +275,16 @@ def _call_model_once(job, instruction, images, schema, config=None):
             result=response.json()
             raw=result['choices'][0]['message']['content']
         except httpx.HTTPStatusError as exc:
+            status=exc.response.status_code
+            if status in (408,429,500,502,503,504):
+                raise ModelRetryableError(f'API 暂时不可用（HTTP {status}），请稍后重试。',retry_delay(exc.response.headers)) from exc
             raise ValueError(f"API 请求失败（HTTP {exc.response.status_code}），请检查地址、密钥、模型权限及图片输入能力。") from exc
         except httpx.TimeoutException as exc:
             raise ModelTimeoutError('API 请求超时；可稍后继续上次分析。') from exc
         except httpx.RequestError as exc:
-            raise ValueError('API 网络连接失败；可检查网络后继续上次分析。') from exc
+            raise ModelRetryableError('API 网络连接失败；可检查网络后继续上次分析。') from exc
         except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise ValueError('API 响应格式不兼容，请检查服务的 Chat Completions 支持情况。') from exc
+            raise ModelFormatError('API 响应格式不兼容，请检查服务的 Chat Completions 支持情况。') from exc
         if result.get('usage'):
             job.setdefault('usage', []).append({'provider':config['provider'], 'model':model, 'tokens':result['usage']})
     try:
@@ -265,16 +293,28 @@ def _call_model_once(job, instruction, images, schema, config=None):
             raw=raw.split('\n',1)[1].rsplit('```',1)[0].strip()
         return schema.model_validate_json(raw).model_dump()
     except (ValueError, TypeError, IndexError, AttributeError) as exc:
-        raise ValueError('模型未返回符合要求的 JSON，请检查模型的图片理解和 JSON 输出能力。') from exc
+        raise ModelFormatError('模型未返回符合要求的 JSON，请检查模型的图片理解和 JSON 输出能力。') from exc
 
 
 
 def call_model(job, instruction, images, schema, config=None):
+    """限制重试次数：临时故障有限重试，格式错误仅增加一次纠正请求。"""
     if schema is Observation:
         instruction += '\n至少在 scene 中填写画面可见内容。即使是纯色、空场、抽象或模糊画面，也请描述可见颜色和形状，不能将全部字段留空。'
     for attempt in range(2):
-        correction = ('\n上一次返回内容为空。请仔细观看图片并填入能够确认的画面描述；若是提示词，请填写四个非空字段。允许未知，但不要所有字段留空。' if attempt else '')
-        result = _call_model_once(job, instruction + correction, images, schema, config)
+        correction = ('\n上一次返回内容为空或格式不符合要求。请按指定 JSON 格式填写能够确认的画面描述；若是提示词，请填写四个非空字段。允许未知，但不要所有字段留空。' if attempt else '')
+        for timeout_attempt in range(2):
+            try:
+                result = _call_model_once(job, instruction + correction, images, schema, config)
+                break
+            except ModelRetryableError as exc:
+                if timeout_attempt or exc.retry_delay is None: raise
+                time.sleep(exc.retry_delay)
+            except ModelFormatError:
+                if attempt: raise
+                result=None
+                break
+        if result is None: continue
         if schema is Observation:
             valid = any(str(result.get(name, '')).strip() for name in ('subject','scene','composition','camera_observation','style')) or any(str(b.get('action','')).strip() for b in result.get('beats',[]))
         elif schema is Prompts:
@@ -285,6 +325,7 @@ def call_model(job, instruction, images, schema, config=None):
     raise ValueError('模型两次返回空的画面描述或提示词，请尝试更换视觉模型。')
 
 def sample_plan(job, index, strategy):
+    """按所选策略为镜头抽帧，并将抽帧依据保存在镜头数据中。"""
     shot=job['shots'][index]
     path=DATA/job['id']/job['video']['file']
     if strategy == 'Prompt 专用':
@@ -405,8 +446,9 @@ def analyze(job, index, config=None, resume=False):
                 if result is None:
                     try:
                         result=call_model(job,f'补看原视频 {a} 到 {b} 毫秒的局部，当前窗口从 {chunk[0]} 到 {chunk[-1]} 毫秒。只描述可观察事实；时间用绝对毫秒，无法确定则填写 unknowns。',chunk,Observation,config)
-                    except ModelTimeoutError:
-                        incomplete.append({'start_ms':a,'end_ms':b,'reason':'补看请求超时，部分区间可能已完成'})
+                    except (ModelRetryableError,ModelFormatError) as exc:
+                        reason='补看请求超时' if isinstance(exc,ModelTimeoutError) else '补看请求失败'
+                        incomplete.append({'start_ms':a,'end_ms':b,'reason':reason+'，部分区间可能已完成'})
                         break
                 for beat in result['beats']:
                     if not start<=beat['start_ms']<beat['end_ms']<=end or any(t not in chunk for t in beat['evidence_ms']):
@@ -457,6 +499,9 @@ def review_prompts(prompts):
                     and not re.search(r'杯口|杯底|顶部|底部|顶端|底端|上端|下端|开口',sentence)):
                 issues.append({'field':key,'warning':'倾斜方向未说明物体的哪个部位，请对照画面核对。'})
                 break
+    for key in ('text_zh','text_en','image_zh','image_en'):
+        if re.search(r'字幕|水印|角标|bilibili|watermark|subtitles?|captions?',(prompts or {}).get(key,'') or '',re.IGNORECASE):
+            issues.append({'field':key,'warning':'提示词包含字幕、水印或类似文字，请确认是否为希望复现的画面内容。'})
     return issues
 
 
@@ -506,7 +551,7 @@ def generate(job,index,config=None):
     if config: shot['prompt_provider']={'provider':config['provider'],'model':config['model']}
     if observation.get('incomplete_review'):
         shot['status']='complete_partial'
-        shot['error']='部分动作补看超时；当前 Prompt 仅基于已完成的观察，请核对后点击“继续上次分析”。'
+        shot['error']='部分动作补看未完成；当前 Prompt 仅基于已完成的观察，请核对后点击“继续上次分析”。'
     else:
         shot['status']='complete';shot['error']=None
     save(job)
@@ -547,6 +592,7 @@ def export(job):
     with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as z:
         if job.get('clips'):
             clip_manifest=[]; written=set()
+            clips.preload(job)
             for clip in job['clips']:
                 evidence=clips.evidence(job,clip['id'])
                 for frame_info in [evidence['source_head'],evidence['source_tail'],*evidence['head_frames'],*evidence['tail_frames']]:

@@ -34,7 +34,20 @@ def load(job_id):
 
 
 def public(job):
-    return {'id': job['id'], 'video': job['video'], 'shots': job['shots'], 'clips': clips.ensure(job), 'api_task': job.get('api_task'), 'subjects':job.get('subjects',{}), 'audio_transcript':job.get('audio_transcript')}
+    """构造 API 展示数据，不把兼容结果写回任务文件。"""
+    items=copy.deepcopy(clips.ensure(job))
+    for clip in items:
+        shot=matching_shot(job,clip)
+        if not clip.get('analysis') and shot and shot.get('prompts') and shot.get('observation'):
+            clip['analysis']=copy.deepcopy(shot)
+            clip['analysis_source']='shot'
+            clip['status']=shot.get('status','pending')
+    return {'id': job['id'], 'video': job['video'], 'shots': job['shots'], 'clips': items, 'api_task': job.get('api_task'), 'subjects':job.get('subjects',{}), 'audio_transcript':job.get('audio_transcript')}
+
+
+def matching_shot(job,clip):
+    # 只有片段范围与镜头完全一致时，才可复用镜头分析结果。
+    return next((s for s in job['shots'] if s['id']==clip['shot_id'] and s['start_ms']==clip['start_ms'] and s['end_ms']==clip['end_ms']),None)
 
 
 @app.post('/api/jobs')
@@ -188,6 +201,9 @@ def analysis_connection(body):
 
 
 def analyze_clip(job_id, clip_id, task_id, config):
+    """基于任务快照分析；仅当片段期间未变化时才提交结果。"""
+    temp = None
+    source = None
     try:
         with lock:
             job = load(job_id)
@@ -211,6 +227,7 @@ def analyze_clip(job_id, clip_id, task_id, config):
         with lock:
             current = load(job_id)
             target = find_clip(current, clip_id)
+            # 防止并发拆分、合并或编辑后，把过期分析结果写回片段。
             if target != source:
                 raise ValueError('片段在分析期间发生变化，结果未覆盖现有内容。')
             target['analysis'] = temp['shots'][0]
@@ -222,6 +239,13 @@ def analyze_clip(job_id, clip_id, task_id, config):
         with lock:
             try:
                 current = load(job_id)
+                if temp is not None and source is not None:
+                    target = find_clip(current, clip_id)
+                    # 保留已完成的模型窗口，以便失败后继续分析。
+                    if target == source:
+                        target['analysis'] = temp['shots'][0]
+                        target['status'] = 'failed'
+                        current.setdefault('usage', []).extend(temp.get('usage', []))
                 message = str(exc)
                 if config.get('key'): message = message.replace(config['key'], '[已隐藏]')
                 current['api_task'] = {'id': task_id, 'clip_id': clip_id, 'status': 'failed', 'error': message[:500]}
@@ -244,7 +268,7 @@ def start_analysis(job_id: str, clip_id: str, body: AnalysisRequest):
         check_idle(job_id)
         job = load(job_id)
         find_clip(job, clip_id)
-        if body.strategy not in ('等间隔', '变化驱动', 'Prompt 专用') or body.image_mode not in ('单帧', '拼图'):
+        if body.strategy not in ('等间隔', '快速（1 FPS）', '变化驱动', 'Prompt 专用') or body.image_mode not in ('单帧', '拼图'):
             raise HTTPException(400, '无效采样策略或发送方式')
         try:
             config = {**analysis_connection(body),
@@ -266,7 +290,14 @@ def save_clip_prompts(job_id: str, clip_id: str, body: PromptEdit):
         job = load(job_id)
         clip = find_clip(job, clip_id)
         analysis = clip.get('analysis')
-        if not analysis: raise HTTPException(400, '请先分析片段')
+        if not analysis:
+            shot=matching_shot(job,clip)
+            if not shot or not shot.get('observation') or not shot.get('prompts'): raise HTTPException(400, '请先分析片段')
+            analysis=copy.deepcopy(shot)
+            analysis['id']=clip_id
+            analysis['source_shot_id']=shot['id']
+            clip['analysis']=analysis
+            clip['status']=shot.get('status','pending')
         prompts = body.model_dump()
         previous = analysis.get('prompts') or {}
         manual = analysis.setdefault('manual_prompts', {})
@@ -385,7 +416,7 @@ def unlink_subject(job_id: str, shot_id: str, body: SubjectBody):
 def sample_shot(job_id: str, shot_id: str, body: SamplingBody):
     with lock:
         check_idle(job_id);job=load(job_id); i=shot_index(job,shot_id);shot=job['shots'][i]
-        if body.strategy not in ('等间隔','变化驱动','Prompt 专用'): raise HTTPException(400,'无效抽帧策略')
+        if body.strategy not in ('等间隔','快速（1 FPS）','变化驱动','Prompt 专用'): raise HTTPException(400,'无效抽帧策略')
         if body.time_ms is not None:
             if not shot['start_ms']<=body.time_ms<shot['end_ms']: raise HTTPException(400,'补帧时间必须在镜头内')
             manual=shot.setdefault('manual_frames',[])
@@ -439,7 +470,7 @@ def run_other(job_id, task_id, operation, config, shot_id):
                     elif result.get('status')=='complete_partial': errors.append(f'{name}：部分结果')
             elif operation=='all':
                 for i,shot in enumerate(job['shots']):
-                    if shot.get('status')!='complete':
+                    if shot.get('status')!='complete' and not shot.get('skip_bulk'):
                         try: engine.analyze(job,i,config,resume=True)
                         except Exception as exc: errors.append(f"{shot['id']}：{exc}")
         with lock:
@@ -462,7 +493,7 @@ def run_other(job_id, task_id, operation, config, shot_id):
 @app.post('/api/jobs/{job_id}/operations/{operation}',status_code=202)
 def start_other(job_id: str, operation: str, body: AnalysisRequest, shot_id: str = ''):
     if operation not in ('shot','all','generate','compare','audio','connection'): raise HTTPException(404,'操作不存在')
-    if body.strategy not in ('等间隔','变化驱动','Prompt 专用') or body.image_mode not in ('单帧','拼图'): raise HTTPException(400,'无效采样策略或发送方式')
+    if body.strategy not in ('等间隔','快速（1 FPS）','变化驱动','Prompt 专用') or body.image_mode not in ('单帧','拼图'): raise HTTPException(400,'无效采样策略或发送方式')
     with lock:
         check_idle(job_id);job=load(job_id)
         if operation in ('shot','generate','compare'): shot_index(job,shot_id)
@@ -473,6 +504,30 @@ def start_other(job_id: str, operation: str, body: AnalysisRequest, shot_id: str
         job['api_task']={'id':tid,'status':'processing','error':None};engine.save(job)
         executor.submit(run_other,job_id,tid,operation,config,shot_id)
         return job['api_task']
+
+
+@app.post('/api/jobs/{job_id}/black-screen-detection')
+def detect_black_screens(job_id: str):
+    import black_frames
+    with lock:
+        check_idle(job_id); job = load(job_id)
+        try: black_frames.detect(job)
+        except ValueError as exc: raise HTTPException(400, str(exc)) from exc
+        engine.save(job)
+        return public(job)
+
+
+class BulkSkipEdit(BaseModel):
+    skip: bool
+
+
+@app.put('/api/jobs/{job_id}/shots/{shot_id}/bulk-skip')
+def edit_bulk_skip(job_id: str, shot_id: str, body: BulkSkipEdit):
+    with lock:
+        check_idle(job_id); job = load(job_id)
+        job['shots'][shot_index(job, shot_id)]['skip_bulk'] = body.skip
+        engine.save(job)
+        return public(job)
 
 class ShotEdit(BaseModel):
     start_ms: int
