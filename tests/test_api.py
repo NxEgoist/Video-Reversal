@@ -10,6 +10,23 @@ from backend.api import app
 
 
 class ApiTests(unittest.TestCase):
+    def test_director_note_persists_and_survives_split_and_merge(self):
+        import clips
+        with tempfile.TemporaryDirectory() as tmp, patch.object(engine, 'DATA', Path(tmp)):
+            (Path(tmp)/'abc').mkdir()
+            job = {'id':'abc', 'video':{'file':'source.mp4','duration_ms':2000}, 'shots':[{'id':'s1','start_ms':0,'end_ms':2000,'status':'pending'}]}
+            clip = clips.ensure(job)[0]; engine.save(job)
+            with TestClient(app) as client:
+                base = '/api/jobs/abc/clips/'
+                self.assertEqual(client.put(base+clip['id']+'/director-note', json={'text':'近景，缓慢推近'}).status_code, 200)
+                self.assertEqual(client.get('/api/jobs/abc').json()['clips'][0]['director_note'], '近景，缓慢推近')
+                parts = client.post(base+clip['id']+'/split', json={'time_ms':1000}).json()['clips']
+                self.assertEqual([c['director_note'] for c in parts], ['近景，缓慢推近']*2)
+                merged = client.post(base+parts[0]['id']+'/merge').json()['clips'][0]
+                self.assertIn('0.00–1.00 秒', merged['director_note'])
+                self.assertIn('近景，缓慢推近', merged['director_note'])
+
+
     def test_full_shot_results_are_visible_to_matching_clip_without_overwriting_edits(self):
         import clips
         with tempfile.TemporaryDirectory() as tmp,patch.object(engine,'DATA',Path(tmp)):
@@ -80,15 +97,18 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(job['api_task']['status'],'complete',job['api_task'])
                     prompts=job['clips'][0]['analysis']['prompts'];prompts['text_zh']='人工修改'
                     self.assertEqual(client.put(f'{base}/clips/{cid}/prompts',json=prompts).status_code,200)
+                    self.assertEqual(client.put(f'{base}/clips/{cid}/director-note',json={'text':'人工观察'}).status_code,200)
                     saved=client.post(f'{base}/cases',json={'title':'合成测试'})
                     self.assertEqual(saved.status_code,200,saved.text)
                     restored=client.post(f"/api/cases/{saved.json()['id']}/restore").json()
                     self.assertEqual(restored['clips'][0]['analysis']['prompts']['text_zh'],'人工修改')
+                    self.assertEqual(restored['clips'][0]['director_note'],'人工观察')
                     archive=client.get(f'{base}/export')
                     self.assertEqual(archive.status_code,200)
                     with zipfile.ZipFile(io.BytesIO(archive.content)) as z:
                         self.assertIn('clips.json',z.namelist())
                         self.assertIn('人工修改',z.read('clips.json').decode())
+                        self.assertIn('人工观察',z.read('clips.json').decode())
 
     def test_all_shots_continues_after_failure_and_reports_partial(self):
         import clips

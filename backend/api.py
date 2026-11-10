@@ -121,6 +121,20 @@ def frame_file(job_id: str, index: int):
     return FileResponse(path, media_type='image/jpeg')
 
 
+class DirectorNote(BaseModel):
+    text: str
+
+
+@app.put('/api/jobs/{job_id}/clips/{clip_id}/director-note')
+def save_director_note(job_id: str, clip_id: str, body: DirectorNote):
+    with lock:
+        check_idle(job_id)
+        job = load(job_id)
+        find_clip(job, clip_id)['director_note'] = body.text
+        engine.save(job)
+        return public(job)
+
+
 class Split(BaseModel):
     time_ms: int
 

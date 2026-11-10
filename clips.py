@@ -32,6 +32,8 @@ def split(job, clip_id, ms):
     if not clip['start_ms'] < ms < clip['end_ms']: raise ValueError('切点必须位于片段内部。')
     left = _new(clip['shot_id'], clip['start_ms'], ms, [clip_id])
     right = _new(clip['shot_id'], ms, clip['end_ms'], [clip_id])
+    if clip.get('director_note'):
+        left['director_note'] = right['director_note'] = clip['director_note']
     job.setdefault('clip_history', []).append(copy.deepcopy(clip))
     items[index:index+1] = [left, right]
     return left, right
@@ -47,6 +49,9 @@ def merge(job, left_id, right_id):
     if left['shot_id'] != right['shot_id'] or left['end_ms'] != right['start_ms']:
         raise ValueError('只能合并同一镜头内相邻的片段。')
     result = _new(left['shot_id'], left['start_ms'], right['end_ms'], [left_id, right_id])
+    notes = [c.get('director_note', '') for c in (left, right)]
+    if any(notes):
+        result['director_note'] = '\n\n'.join(f"{c['start_ms']/1000:.2f}–{c['end_ms']/1000:.2f} 秒：\n{note}" for c, note in zip((left, right), notes) if note)
     job.setdefault('clip_history', []).extend(copy.deepcopy([left, right]))
     items[index:index+2] = [result]
     return result
@@ -62,6 +67,9 @@ def reset_shot(job, shot_id):
     old = [items[i] for i in indices]
     job.setdefault('clip_history', []).extend(copy.deepcopy(old))
     result = _new(shot_id, shot['start_ms'], shot['end_ms'], [c['id'] for c in old])
+    notes = [c for c in old if c.get('director_note')]
+    if notes:
+        result['director_note'] = '\n\n'.join(f"{c['start_ms']/1000:.2f}–{c['end_ms']/1000:.2f} 秒：\n{c['director_note']}" for c in notes)
     items[indices[0]:indices[-1]+1] = [result]
     return result
 
