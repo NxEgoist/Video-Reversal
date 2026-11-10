@@ -1,0 +1,2 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+*{box-sizing:border-box}body{margin:0;font-family:'DM Sans', 'PingFang SC', 'Microsoft YaHei',sans-serif;color:#252725;background:#f6f6f2}button,input{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.5}input:focus-visible,button:focus-visible,.upload:focus-within,.empty-button:focus-within{outline:2px solid #a9c952;outline-offset:2px}input[type=file]{position:absolute;width:1px;height:1px;opacity:0}

@@ -57,8 +57,9 @@ def adaptive_samples(path, start, end):
 def plan(path, start, end, strategy, manual=None):
     if strategy == '变化驱动':
         marks = {p['ms']:set(p['reasons']) for p in adaptive_samples(path,start,end)}
-    elif strategy == '等间隔':
-        marks = {t:{'等间隔'} for t in range(start,end,500)}
+    elif strategy in ('等间隔', '快速（1 FPS）'):
+        step = 1000 if strategy == '快速（1 FPS）' else 500
+        marks = {t:{strategy} for t in range(start,end,step)}
         for t in (start,(start+end)//2,max(start,end-100)): marks.setdefault(t,set()).add('基础')
     else:
         raise ValueError('未知的抽帧策略。')

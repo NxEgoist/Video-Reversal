@@ -7,3 +7,7 @@ __pycache__/
 work/
 outputs/
 .DS_Store
+frontend/node_modules/
+frontend/dist/
+.model-settings.json
+.model-settings-*

@@ -2,6 +2,18 @@ import unittest
 import engine
 
 class Tests(unittest.TestCase):
+    def test_prompt_overlay_mentions_are_flagged_for_review(self):
+        issues=engine.review_prompts({'text_zh':'画面下方可见中英文字幕。','image_en':'The bilibili watermark is visible.'})
+        self.assertEqual({i['field'] for i in issues},{'text_zh','image_en'})
+        self.assertTrue(all('文字' in i['warning'] for i in issues))
+        self.assertEqual(engine.review_prompts({'text_zh':'人物走过灯光明亮的舞台。'}),[])
+    def test_transient_timeout_retries_same_provider_once(self):
+        from unittest.mock import patch
+        result=engine.Observation(scene='已观察画面').model_dump()
+        with patch.object(engine,'_call_model_once',side_effect=[engine.ModelTimeoutError('超时'),result]) as call, patch('engine.time.sleep'):
+            actual=engine.call_model({},'观察',[100],engine.Observation,{'provider':'硅基流动'})
+        self.assertEqual(actual['scene'],'已观察画面')
+        self.assertEqual(call.call_count,2)
     def test_sampling(self):
         values=engine.times(1000,2300)
         self.assertEqual(values,sorted(set(values)))
@@ -13,6 +25,22 @@ class Tests(unittest.TestCase):
 if __name__=='__main__': unittest.main()
 
 class WorkflowTests(unittest.TestCase):
+    def test_accepts_two_minute_video(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            folder=Path(tmp); video=folder/'source.mp4'
+            engine.run(['ffmpeg','-v','error','-f','lavfi','-i','color=c=black:s=64x64:r=1:d=121','-c:v','libx264','-pix_fmt','yuv420p','-y',str(video)])
+            with patch.object(engine,'DATA',folder/'data'):
+                engine.DATA.mkdir()
+                job=engine.create(str(video))
+                self.assertGreater(job['video']['duration_ms'],60000)
+                self.assertLessEqual(job['video']['duration_ms'],180000)
+                engine.run(['ffmpeg','-v','error','-f','lavfi','-i','color=c=black:s=64x64:r=1:d=181','-c:v','libx264','-pix_fmt','yuv420p','-y',str(video)])
+                with self.assertRaisesRegex(ValueError,'180 秒'):
+                    engine.create(str(video))
+
     def test_video_to_export_with_stubbed_model(self):
         import json, tempfile, zipfile
         from pathlib import Path
@@ -52,6 +80,54 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual(json.loads(archive.read('analysis.json'))['id'],job['id'])
 
 class ProviderTests(unittest.TestCase):
+    def test_opencode_go_includes_stable_session_header(self):
+        from unittest.mock import patch
+        import httpx,json
+        config=engine.connection('自定义（OpenAI 兼容）','vision','https://opencode.ai/zen/go/v1','test-secret')
+        response=httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'text_zh':'中','text_en':'en','image_zh':'动','image_en':'move'})}}]},request=httpx.Request('POST',config['url']))
+        with patch('engine.httpx.post',return_value=response) as post:
+            engine.call_model({},'test',[],engine.Prompts,config)
+            engine.call_model({},'test',[],engine.Prompts,config)
+        first=post.call_args_list[0].kwargs['headers']['x-opencode-session']
+        second=post.call_args_list[1].kwargs['headers']['x-opencode-session']
+        self.assertTrue(first)
+        self.assertEqual(first,second)
+
+    def test_retryable_status_is_bounded_and_auth_is_not_retried(self):
+        from unittest.mock import patch
+        import httpx, json
+        config=engine.connection('自定义（OpenAI 兼容）','vision','https://api.example.com/v1','secret')
+        request=httpx.Request('POST',config['url'])
+        ok=httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'text_zh':'中','text_en':'en','image_zh':'动','image_en':'move'})}}]},request=request)
+        busy=httpx.Response(429,headers={'Retry-After':'3'},request=request)
+        with patch('engine.httpx.post',side_effect=[busy,ok]) as post,patch('engine.time.sleep') as sleep:
+            self.assertEqual(engine.call_model({},'test',[],engine.Prompts,config)['text_zh'],'中')
+        self.assertEqual(post.call_count,2)
+        sleep.assert_called_once_with(3)
+        forbidden=httpx.Response(401,request=request)
+        with patch('engine.httpx.post',return_value=forbidden) as post,patch('engine.time.sleep') as sleep:
+            with self.assertRaises(ValueError): engine.call_model({},'test',[],engine.Prompts,config)
+        self.assertEqual(post.call_count,1)
+        sleep.assert_not_called()
+
+    def test_bad_json_retries_then_succeeds_without_exposing_payload(self):
+        from unittest.mock import patch
+        result=engine.Prompts(text_zh='中',text_en='en',image_zh='动',image_en='move').model_dump()
+        with patch.object(engine,'_call_model_once',side_effect=[engine.ModelFormatError('格式错误'),result]) as call:
+            self.assertEqual(engine.call_model({},'test',[],engine.Prompts,{'provider':'test'})['text_zh'],'中')
+        self.assertEqual(call.call_count,2)
+
+    def test_long_retry_after_is_not_retried_early(self):
+        from unittest.mock import patch
+        import httpx
+        config=engine.connection('自定义（OpenAI 兼容）','vision','https://api.example.com/v1','secret')
+        request=httpx.Request('POST',config['url'])
+        response=httpx.Response(429,headers={'Retry-After':'60'},request=request)
+        with patch('engine.httpx.post',return_value=response) as post,patch('engine.time.sleep') as sleep:
+            with self.assertRaises(engine.ModelRetryableError): engine.call_model({},'test',[],engine.Prompts,config)
+        self.assertEqual(post.call_count,1)
+        sleep.assert_not_called()
+
     def test_custom_base_url_and_local_no_key(self):
         c=engine.connection('自定义（OpenAI 兼容）','vision-model','http://127.0.0.1:11434/v1','')
         self.assertEqual(c['url'],'http://127.0.0.1:11434/v1/chat/completions')

@@ -22,6 +22,7 @@
 | 跨片段素材与衔接 | `clip_context.py`、`subjects.py` | 上下文确认、失效、分析提示词及相应测试 |
 | 案例、复现与导出 | `cases.py`、`reconstruction.py`、`engine.export` | `app.py` 对应入口、文件路径、旧数据和测试 |
 | 音频 | `audio.py`、`app.py` 音频函数 | 供应商请求、人工修订、全片作用范围、相关测试 |
+| React 工作台和 API | `frontend/src/App.tsx`、`backend/api.py` | `FRONTEND_MIGRATION.md`、现有引擎及 `tests/test_api.py`；当前仅实现部分流程 |
 
 ## 阅读时必须核对的边界
 
@@ -39,7 +40,7 @@
 python -m unittest discover -s tests
 ```
 
-在已配置的虚拟环境中也可以用 `.venv/bin/python` 代替 `python`。部分测试需要 FFmpeg / FFprobe；转场专用能力另有可选依赖，安装方式查看 `requirements-transnet.txt`。涉及模型请求时默认使用模拟，不把测试通过误认为外部服务、真实模型效果或生成质量已验证。
+在已配置的虚拟环境中也可以用 `.venv/bin/python` 代替 `python`。API 测试需要 `requirements-api.txt`；部分测试需要 FFmpeg / FFprobe；转场专用能力另有可选依赖，安装方式查看 `requirements-transnet.txt`。涉及模型请求时默认使用模拟，不把测试通过误认为外部服务、真实模型效果或生成质量已验证。
 
 ## 文档关系
 
